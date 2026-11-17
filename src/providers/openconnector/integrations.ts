@@ -12,6 +12,7 @@ import { googleActivity } from '../google/activity.ts';
 import { pollGmailInbox } from '../google/gmail-inbox.ts';
 import { readInboxSnippets, readInboxThreads, readSentEmails } from '../google/sent-email.ts';
 import { type GoogleProxy, readVerificationEmails } from '../google/verification-email.ts';
+import { createOpenConnectorFiles, markTransitFileInputs, unwrapTransitFileIds } from './files.ts';
 
 const service = z.string().regex(/^[a-z][a-z0-9_]{0,79}$/);
 const nodAction = /^[A-Z][A-Z0-9_]*_[A-Z0-9_]+$/;
@@ -43,6 +44,7 @@ const actionEntry = z.object({
 const triggerCursor = z
   .object({ accountId: appId, checkpoint: z.object({ historyId: z.string().regex(/^\d{1,32}$/) }) })
   .strict();
+const transitFileUpload = z.object({ fileId: z.string().min(1).max(200) });
 const responseBytes = 64 * 1024 * 1024;
 const signInWindow = 16 * 60_000;
 
@@ -126,7 +128,12 @@ export function createOpenConnectorProvider(options: {
   const tokens = { runtime: options.runtimeToken.trim(), admin: options.adminToken.trim() };
   if (!tokens.runtime || !tokens.admin)
     throw new Error('OpenConnector needs both a runtime token and an admin token.');
+  const files = createOpenConnectorFiles({
+    origin: root,
+    ...(options.request ? { request: options.request } : {}),
+  });
   let catalog: { services: IntegrationServiceInfo[]; expiresAt: number } | undefined;
+  const uploads = new Set<string>();
 
   function owner(ownerId: string) {
     if (ownerId !== options.ownerId)
@@ -140,6 +147,7 @@ export function createOpenConnectorProvider(options: {
     path: string,
     input: {
       body?: unknown;
+      form?: FormData;
       signal?: AbortSignal;
       timeout?: number;
       account?: string;
@@ -158,10 +166,14 @@ export function createOpenConnectorProvider(options: {
         headers: {
           authorization: `Bearer ${tokens[scope]}`,
           accept: path === '/mcp' ? 'application/json, text/event-stream' : 'application/json',
-          ...(input.body === undefined ? {} : { 'content-type': 'application/json' }),
+          ...(input.body === undefined || input.form ? {} : { 'content-type': 'application/json' }),
           ...(input.account ? { 'x-oo-connector-app-id': input.account } : {}),
         },
-        ...(input.body === undefined ? {} : { body: JSON.stringify(input.body) }),
+        ...(input.form
+          ? { body: input.form }
+          : input.body === undefined
+            ? {}
+            : { body: JSON.stringify(input.body) }),
         redirect: 'error',
         signal,
       });
@@ -409,6 +421,17 @@ export function createOpenConnectorProvider(options: {
     );
   }
 
+  async function removeUpload(fileId: string) {
+    uploads.delete(fileId);
+    await call(
+      'remove an uploaded file',
+      'admin',
+      'DELETE',
+      `/api/files/${encodeURIComponent(fileId)}`,
+      { timeout: 10_000 },
+    ).catch(() => {});
+  }
+
   async function disconnect(id: string) {
     const saved = await connection(id);
     await call(
@@ -521,6 +544,13 @@ export function createOpenConnectorProvider(options: {
   }
 
   function session(accounts: Map<string, Set<string>>): IntegrationSession {
+    function uploaded(value: unknown): string[] {
+      if (Array.isArray(value)) return value.flatMap(uploaded);
+      if (!value || typeof value !== 'object') return [];
+      return Object.entries(value).flatMap(([key, item]) =>
+        key === 'fileId' && typeof item === 'string' && uploads.has(item) ? [item] : uploaded(item),
+      );
+    }
     const enabled = [...accounts.keys()].sort((left, right) => right.length - left.length);
     function actionId(action: string) {
       if (!nodAction.test(action)) return undefined;
@@ -604,7 +634,7 @@ export function createOpenConnectorProvider(options: {
           tools[name] = {
             toolkit: entry.service,
             description: entry.description ?? name,
-            inputSchema: entry.inputSchema,
+            inputSchema: markTransitFileInputs(entry.inputSchema),
             ...(entry.outputSchema ? { outputSchema: entry.outputSchema } : {}),
           };
         }
@@ -623,14 +653,42 @@ export function createOpenConnectorProvider(options: {
         if (!id) throw new Error('This action is outside the connected apps.');
         if (!accountId || !accounts.get(id.split('.')[0]!)?.has(accountId))
           throw new Error('Choose a connected account for this action.');
+        const input = unwrapTransitFileIds(args);
+        const sent = uploaded(input);
         const result = await data(
           `run ${action}`,
           'runtime',
           'POST',
           `/v1/actions/${encodeURIComponent(id)}`,
-          { body: { input: args }, account: accountId, signal, timeout: 300_000 },
+          { body: { input }, account: accountId, signal, timeout: 300_000 },
+        ).finally(() => Promise.all(sent.map(removeUpload)));
+        signal?.throwIfAborted();
+        return { data: await files(result ?? null, signal ?? new AbortController().signal) };
+      },
+      async upload(_action, file, signal) {
+        signal?.throwIfAborted();
+        const what = 'upload the file for this app';
+        const form = new FormData();
+        form.set(
+          'file',
+          new Blob([Uint8Array.from(file.bytes)], { type: file.mimeType }),
+          file.name,
         );
-        return { data: result ?? null };
+        const stored = shape(
+          what,
+          transitFileUpload,
+          await call(what, 'admin', 'POST', '/api/files', {
+            form,
+            ...(signal ? { signal } : {}),
+            timeout: 300_000,
+          }),
+        );
+        if (signal?.aborted) {
+          await removeUpload(stored.fileId);
+          signal.throwIfAborted();
+        }
+        uploads.add(stored.fileId);
+        return { fileId: stored.fileId };
       },
     };
   }

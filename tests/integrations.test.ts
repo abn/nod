@@ -47,6 +47,7 @@ import {
   IntegrationCatalogAccessDenied,
   IntegrationCatalogFailure,
   IntegrationConnectionError,
+  IntegrationDownload,
   IntegrationInboxCursorExpired,
   IntegrationInboxTransientError,
   IntegrationPermissionError,
@@ -59,6 +60,11 @@ import { createComposioProvider } from '../src/providers/composio/integrations.t
 import { createComposioProxy } from '../src/providers/composio/proxy.ts';
 import { logFailure, withFailureLog } from '../src/server/failure-log.ts';
 import { createOpenConnectorProvider } from '../src/providers/openconnector/integrations.ts';
+import {
+  markTransitFileInputs,
+  transitFileInputSchema,
+} from '../src/providers/openconnector/files.ts';
+import { workspaceFileSchemas } from '../src/server/integration-files.ts';
 import { verifyIntegrationCompletion } from '../src/server/integration-connection.ts';
 import { serviceEnvironment } from '../src/providers/process.ts';
 import { createIntegrationIdentityCheckpoint } from '../src/server/integration-identity.ts';
@@ -16011,15 +16017,85 @@ async function openConnectorFake(t: TestContext) {
     }
   >();
   const schema = { type: 'object', properties: { to: { type: 'string' } } };
-  const actions = ['send_email', 'fetch_emails', 'list_labels', 'Bad-Name'].map((name) => ({
-    id: `gmail.${name}`,
-    service: 'gmail',
-    name,
-    description: `Synthetic ${name}.`,
-    operationType: 'read',
-    inputSchema: schema,
-    outputSchema: { type: 'object' },
-  }));
+  const transitFile = {
+    type: 'object',
+    properties: {
+      fileId: {
+        type: 'string',
+        minLength: 1,
+        description: 'The transit file identifier returned by POST /api/files.',
+      },
+      name: {
+        type: 'string',
+        minLength: 1,
+        description: 'Optional filename override to send to the provider.',
+      },
+      mimeType: {
+        type: 'string',
+        minLength: 1,
+        description: 'Optional MIME type override to send to the provider.',
+      },
+    },
+    additionalProperties: false,
+    required: ['fileId'],
+    description: 'File uploaded through POST /api/files.',
+  };
+  const downloadAttachment = {
+    ...transitFile,
+    description: 'Completed transit file.',
+  };
+  const actions = [
+    ...['send_email', 'fetch_emails', 'list_labels', 'Bad-Name'].map((name) => ({
+      id: `gmail.${name}`,
+      service: 'gmail',
+      name,
+      description: `Synthetic ${name}.`,
+      operationType: 'read',
+      inputSchema: schema,
+      outputSchema: { type: 'object' },
+    })),
+    {
+      id: 'gmail.send_attachment',
+      service: 'gmail',
+      name: 'send_attachment',
+      description: 'Synthetic send_attachment.',
+      operationType: 'write',
+      inputSchema: {
+        type: 'object',
+        properties: { to: { type: 'string' }, file: transitFile },
+        additionalProperties: false,
+        required: ['to', 'file'],
+      },
+      outputSchema: { type: 'object' },
+    },
+    {
+      id: 'gmail.download_attachment',
+      service: 'gmail',
+      name: 'download_attachment',
+      description: 'Synthetic download_attachment.',
+      operationType: 'read',
+      inputSchema: {
+        type: 'object',
+        properties: { messageId: { type: 'string' } },
+        additionalProperties: false,
+        required: ['messageId'],
+      },
+      outputSchema: downloadAttachment,
+    },
+  ];
+  const transitFiles = new Map<string, { bytes: Buffer; name: string; mimeType: string }>();
+  const attachmentId = `${'a'.repeat(32)}.txt`;
+  transitFiles.set(attachmentId, {
+    bytes: Buffer.from('Synthetic attachment bytes.'),
+    name: 'report.txt',
+    mimeType: 'text/plain',
+  });
+  const uploads: Array<{
+    scope: 'admin' | 'runtime' | 'none';
+    name: string;
+    mimeType: string;
+    bytes: Buffer;
+  }> = [];
   let checkpointExpired = false;
   const blocked = new Set<string>();
   let policyAvailable = true;
@@ -16028,8 +16104,12 @@ async function openConnectorFake(t: TestContext) {
     const url = new URL(request.url!, 'http://fixture.invalid');
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(chunk as Buffer);
-    const raw = Buffer.concat(chunks).toString();
-    const body = raw ? JSON.parse(raw) : undefined;
+    const raw = Buffer.concat(chunks);
+    const contentType = String(request.headers['content-type'] ?? '');
+    const body =
+      raw.length && !contentType.startsWith('multipart/form-data')
+        ? JSON.parse(raw.toString())
+        : undefined;
     const bearer = request.headers.authorization;
     const scope =
       bearer === `Bearer ${adminToken}`
@@ -16046,13 +16126,47 @@ async function openConnectorFake(t: TestContext) {
     const ok = (data: unknown) => send(200, { success: true, message: 'OK', data, meta: {} });
     const fail = (status: number, errorCode: string, message: string) =>
       send(status, { success: false, message, data: null, errorCode, meta: {} });
+    const publicFile = request.method === 'GET' && /^\/api\/files\/[^/]+$/.test(url.pathname);
     const management =
       url.pathname.startsWith('/api/') ||
       url.pathname.startsWith('/v1/connections') ||
       url.pathname.startsWith('/v1/connection-requests/');
-    if (scope !== (management ? 'admin' : 'runtime'))
+    if (!publicFile && scope !== (management ? 'admin' : 'runtime'))
       return fail(401, 'unauthorized', 'A valid bearer token is required.');
     const path = url.pathname.split('/').map(decodeURIComponent);
+    if (request.method === 'POST' && url.pathname === '/api/files') {
+      const form = await new Response(raw, { headers: { 'content-type': contentType } }).formData();
+      const file = form.get('file');
+      if (!(file instanceof File))
+        return send(400, { error: { code: 'invalid_input', message: 'file is required.' } });
+      const bytes = Buffer.from(await file.arrayBuffer());
+      const fileId = `${randomBytes(16).toString('hex')}${file.name.endsWith('.txt') ? '.txt' : ''}`;
+      transitFiles.set(fileId, { bytes, name: file.name, mimeType: file.type });
+      uploads.push({ scope, name: file.name, mimeType: file.type, bytes });
+      return send(200, {
+        fileId,
+        downloadUrl: `${url.origin}/api/files/${fileId}`,
+        sizeBytes: bytes.length,
+        name: file.name,
+        mimeType: file.type,
+      });
+    }
+    if (request.method === 'DELETE' && /^\/api\/files\/[^/]+$/.test(url.pathname)) {
+      const fileId = decodeURIComponent(url.pathname.split('/').at(-1)!);
+      return send(200, { fileId, deleted: transitFiles.delete(fileId) });
+    }
+    if (request.method === 'GET' && /^\/api\/files\/[^/]+$/.test(url.pathname)) {
+      const stored = transitFiles.get(decodeURIComponent(url.pathname.split('/').at(-1)!));
+      if (!stored)
+        return send(404, {
+          error: { code: 'file_not_found', message: 'Transit file was not found.' },
+        });
+      response.writeHead(200, {
+        'content-type': stored.mimeType,
+        'content-length': String(stored.bytes.length),
+      });
+      return response.end(stored.bytes);
+    }
     if (request.method === 'GET' && url.pathname === '/api/oauth/configs')
       return send(200, [
         { service: 'gmail', configured: true, oauthSource: { mode: 'local' } },
@@ -16155,6 +16269,17 @@ async function openConnectorFake(t: TestContext) {
       if (!app || !connections.has(app))
         return fail(403, 'connection_not_allowed', 'The selected connection is not granted.');
       if (path[3] === 'gmail.send_email') return ok({ id: 'fixture-message' });
+      if (path[3] === 'gmail.send_attachment') return ok({ id: 'fixture-attachment-message' });
+      if (path[3] === 'gmail.download_attachment') {
+        const stored = transitFiles.get(attachmentId)!;
+        return ok({
+          fileId: attachmentId,
+          downloadUrl: `${url.origin}/api/files/${attachmentId}`,
+          sizeBytes: stored.bytes.length,
+          name: stored.name,
+          mimeType: stored.mimeType,
+        });
+      }
       if (path[3] === 'gmail.list_labels')
         return fail(403, 'scope_missing', 'The gmail.labels scope is missing.');
       return fail(502, 'provider_error', 'Gmail answered with a synthetic outage.');
@@ -16258,6 +16383,8 @@ async function openConnectorFake(t: TestContext) {
     runtimeToken,
     adminToken,
     requests,
+    uploads,
+    attachmentId,
     pending,
     connections,
     connect,
@@ -16354,6 +16481,167 @@ test('OpenConnector is selected only by explicit server configuration and fails 
     });
 });
 
+test('OpenConnector uploads workspace files into transit storage and saves the files its actions return', async (t) => {
+  const fake = await openConnectorFake(t);
+  const provider = fake.provider();
+  const account = fake.connect();
+  const signal = new AbortController().signal;
+  const session = await provider.createSession('local-development', { gmail: [account] });
+  const tools = (await session.search('GMAIL_SEND_ATTACHMENT')).tools as Record<
+    string,
+    { inputSchema: Record<string, any> }
+  >;
+  const inputSchema = tools.GMAIL_SEND_ATTACHMENT!.inputSchema;
+  assert.equal(inputSchema.properties.file.file_uploadable, true);
+  assert.equal(inputSchema.properties.to.file_uploadable, undefined);
+  assert.equal(
+    transitFileInputSchema({
+      type: 'object',
+      properties: { fileId: { type: 'string' }, mimeType: { type: 'string' } },
+      additionalProperties: false,
+      required: ['fileId'],
+    }),
+    false,
+  );
+  assert.equal(
+    transitFileInputSchema({
+      type: 'object',
+      properties: { fileId: { type: 'string', description: 'The local transit file identifier.' } },
+      required: ['fileId'],
+    }),
+    true,
+  );
+  assert.equal(
+    transitFileInputSchema({
+      type: 'object',
+      properties: {
+        fileId: { type: 'string', description: 'The local transit file identifier to upload.' },
+        parentId: { type: 'string' },
+      },
+      required: ['parentId'],
+    }),
+    false,
+  );
+  const offered = workspaceFileSchemas(inputSchema) as {
+    properties: { file: { anyOf: Array<Record<string, any>> }; to: unknown };
+  };
+  assert.equal(offered.properties.file.anyOf.length, 2);
+  assert.deepEqual(offered.properties.to, inputSchema.properties.to);
+
+  const bytes = Buffer.from('Synthetic workspace file.');
+  const uploaded = await session.upload!(
+    'GMAIL_SEND_ATTACHMENT',
+    { name: 'notes.txt', mimeType: 'text/plain', bytes },
+    signal,
+    account,
+  );
+  assert.deepEqual(Object.keys(uploaded), ['fileId']);
+  assert.deepEqual(fake.uploads, [
+    { scope: 'admin', name: 'notes.txt', mimeType: 'text/plain', bytes },
+  ]);
+
+  const running = await provider.createSession('local-development', { gmail: [account] });
+  await running.execute(
+    'GMAIL_SEND_ATTACHMENT',
+    { to: 'person@example.test', file: uploaded },
+    account,
+    signal,
+  );
+  assert.deepEqual(
+    fake.requests
+      .filter(
+        (entry) => entry.method === 'POST' && entry.path === '/v1/actions/gmail.send_attachment',
+      )
+      .map(({ method, scope, app, body }) => ({ method, scope, app, body })),
+    [
+      {
+        method: 'POST',
+        scope: 'runtime',
+        app: account,
+        body: { input: { to: 'person@example.test', file: uploaded } },
+      },
+    ],
+  );
+  assert.deepEqual(
+    fake.requests
+      .filter((entry) => entry.method === 'DELETE')
+      .map(({ path, scope }) => ({ path, scope })),
+    [{ path: `/api/files/${uploaded.fileId}`, scope: 'admin' }],
+  );
+
+  const stopped = new AbortController();
+  const stopping = fake.provider('local-development', async (input, init) => {
+    const response = await fetch(input, init);
+    if (!String(input).endsWith('/api/files') || init?.method !== 'POST') return response;
+    const body = await response.text();
+    stopped.abort();
+    return new Response(body, { status: response.status, headers: response.headers });
+  });
+  const stoppedSession = await stopping.createSession('local-development', { gmail: [account] });
+  const before = fake.requests.filter((entry) => entry.method === 'DELETE').length;
+  await assert.rejects(
+    stoppedSession.upload!(
+      'GMAIL_SEND_ATTACHMENT',
+      { name: 'stopped.txt', mimeType: 'text/plain', bytes },
+      stopped.signal,
+      account,
+    ),
+  );
+  const removed = fake.requests.filter((entry) => entry.method === 'DELETE').slice(before);
+  assert.equal(removed.length, 1);
+  assert.match(removed[0]!.path, /^\/api\/files\/[a-f0-9]{32}\.txt$/);
+
+  const bare = markTransitFileInputs({
+    type: 'object',
+    properties: {
+      parentId: { type: 'string' },
+      fileId: { type: 'string', description: 'The local transit file identifier to upload.' },
+      name: { type: 'string', description: 'Optional name; defaults to the transit file name.' },
+    },
+    required: ['parentId'],
+  }) as { properties: Record<string, { file_uploadable?: boolean }> };
+  assert.equal(bare.properties.fileId!.file_uploadable, true);
+  assert.equal(bare.properties.name!.file_uploadable, undefined);
+  const attached = await session.upload!(
+    'GMAIL_SEND_ATTACHMENT',
+    { name: 'bare.txt', mimeType: 'text/plain', bytes },
+    signal,
+    account,
+  );
+  await running.execute(
+    'GMAIL_SEND_ATTACHMENT',
+    { to: 'person@example.test', fileId: attached },
+    account,
+    signal,
+  );
+  assert.deepEqual(
+    fake.requests
+      .filter(
+        (entry) => entry.method === 'POST' && entry.path === '/v1/actions/gmail.send_attachment',
+      )
+      .at(-1)?.body,
+    { input: { to: 'person@example.test', fileId: attached.fileId } },
+  );
+
+  const result = (await session.execute(
+    'GMAIL_DOWNLOAD_ATTACHMENT',
+    { messageId: 'message-1' },
+    account,
+    signal,
+  )) as { data: IntegrationDownload };
+  assert.ok(result.data instanceof IntegrationDownload);
+  const saved = (await result.data.start()) as IntegrationFile;
+  assert.equal(saved.name, 'report.txt');
+  assert.equal(saved.mimeType, 'text/plain');
+  assert.equal(Buffer.from(saved.bytes).toString(), 'Synthetic attachment bytes.');
+  assert.deepEqual(
+    fake.requests
+      .filter((entry) => entry.method === 'GET' && entry.path.startsWith('/api/files/'))
+      .map(({ path, scope }) => ({ path, scope })),
+    [{ path: `/api/files/${fake.attachmentId}`, scope: 'none' }],
+  );
+});
+
 test('OpenConnector actions map to exact connector IDs, use only the runtime token and the selected account, and run once', async (t) => {
   const fake = await openConnectorFake(t);
   const provider = fake.provider();
@@ -16362,8 +16650,10 @@ test('OpenConnector actions map to exact connector IDs, use only the runtime tok
   const session = await provider.createSession('local-development', { gmail: [account] });
   const found = await session.search('send an email');
   assert.deepEqual(Object.keys(found.tools as object).sort(), [
+    'GMAIL_DOWNLOAD_ATTACHMENT',
     'GMAIL_FETCH_EMAILS',
     'GMAIL_LIST_LABELS',
+    'GMAIL_SEND_ATTACHMENT',
     'GMAIL_SEND_EMAIL',
   ]);
   assert.equal(await session.offers!('GMAIL_SEND_EMAIL'), true);
