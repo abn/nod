@@ -133,7 +133,7 @@ Set up OpenConnector first:
 
 Then set the variables above and restart Nod. Accounts connected through Composio stay listed but need connecting again.
 
-Nod saves an account only after OpenConnector confirms the sign-in. **Reconnect** creates a new OpenConnector connection and keeps it only when OpenConnector reports the same provider account and email; otherwise Nod removes it and keeps the saved one. Disconnecting removes the connection from OpenConnector but does not revoke the grant at the app; revoke it in the app's settings if needed. When you abandon a sign-in, Nod removes the connection OpenConnector created for it, including one finished in OpenConnector after Nod gave up, as long as Nod keeps running for 16 minutes after you abandon it.
+Nod saves an account only after OpenConnector confirms the sign-in. **Reconnect** creates a new OpenConnector connection and keeps it only when OpenConnector reports the same provider account, and the same email when the account has one; otherwise Nod removes it and keeps the saved one. Disconnecting removes the connection from OpenConnector but does not revoke the grant at the app; revoke it in the app's settings if needed. When you abandon a sign-in, Nod removes the connection OpenConnector created for it, including one finished in OpenConnector after Nod gave up, as long as Nod keeps running for 16 minutes after you abandon it.
 
 Nod's server must reach `/v1`, `/mcp` and `/api` at that address; a reverse proxy that leaves out `/mcp` breaks app search.
 

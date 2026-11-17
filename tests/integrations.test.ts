@@ -59,6 +59,7 @@ import { createComposioProvider } from '../src/providers/composio/integrations.t
 import { createComposioProxy } from '../src/providers/composio/proxy.ts';
 import { logFailure, withFailureLog } from '../src/server/failure-log.ts';
 import { createOpenConnectorProvider } from '../src/providers/openconnector/integrations.ts';
+import { verifyIntegrationCompletion } from '../src/server/integration-connection.ts';
 import { serviceEnvironment } from '../src/providers/process.ts';
 import { createIntegrationIdentityCheckpoint } from '../src/server/integration-identity.ts';
 import { createIntegrationBrowser } from '../src/server/integration-browser.ts';
@@ -16496,6 +16497,50 @@ test('OpenConnector polls Gmail history through its Gmail proxy, carries over tr
   await assert.rejects(
     provider.pollInbox!(account, next.cursor, signal),
     IntegrationInboxCursorExpired,
+  );
+});
+
+test('OpenConnector reconnects an account without an email label only when the same provider account signs in', async (t) => {
+  const fake = await openConnectorFake(t);
+  const provider = fake.provider();
+  const owner = 'local-development';
+  const saved = fake.connect('Team workspace', 'provider-team');
+  const original = await provider.inspectAccount(saved, owner);
+  assert.equal(original.accountEmail, undefined);
+  const attempt = async (account: string, selected = provider) => {
+    const state = randomBytes(32).toString('base64url');
+    const started = await provider.reconnectAccount!(
+      owner,
+      'gmail',
+      saved,
+      'http://localhost:4310/api/apps/callback',
+    );
+    fake.complete(started.accountId.split(':').at(-1)!, 'connected', 'Team workspace', account);
+    const parsed = await provider.parseCallback(
+      { state },
+      { accountId: started.accountId, service: 'gmail' },
+    );
+    return verifyIntegrationCompletion({
+      parsed,
+      provider: selected,
+      ownerId: owner,
+      pending: {
+        service: 'gmail',
+        callbackHash: createHash('sha256').update(state).digest('hex'),
+        accountId: started.accountId,
+        claimed: true,
+        configurationId: provider.configurationId ?? null,
+        verifyOwner: true,
+        originalEmail: null,
+        originalAuthConfigId: started.authConfigId,
+      },
+    });
+  };
+  assert.equal((await attempt('provider-team')).remote.authConfigId, original.authConfigId);
+  await assert.rejects(attempt('provider-other'), /Sign in with the original account/);
+  await assert.rejects(
+    attempt('provider-team', { ...provider, accountBoundReconnect: false }),
+    /Sign in with the original account/,
   );
 });
 
